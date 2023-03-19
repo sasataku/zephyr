@@ -1,0 +1,17 @@
+description: Space Cubics CAN controller
+
+compatible: "sc,can"
+
+include: [can-controller.yaml]
+
+properties:
+  reg:
+    required: true
+
+  interrupts:
+    required: true
+
+  clock-frequency:
+    type: int
+    description: Clock frequency information for CAN
+    required: true
