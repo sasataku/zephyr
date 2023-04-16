@@ -9,3 +9,11 @@ config CAN_SCCAN
 	depends on DT_HAS_SC_CAN_ENABLED
 	help
 	  Enable Space Cubics CAN Driver.
+
+config CAN_SCCAN_MAX_FILTER
+	int "Maximum number of acceptance filters"
+	depends on CAN_SCCAN
+	default 4
+	range 1 4
+	help
+	  Defines the array size of the callback/msgq pointers.

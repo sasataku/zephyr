@@ -11,6 +11,7 @@
 #include <zephyr/drivers/can.h>
 #include <zephyr/drivers/can/transceiver.h>
 #include <zephyr/logging/log.h>
+#include <zephyr/sys/byteorder.h>
 
 LOG_MODULE_REGISTER(sc_can, CONFIG_CAN_LOG_LEVEL);
 
@@ -87,21 +88,61 @@ LOG_MODULE_REGISTER(sc_can, CONFIG_CAN_LOG_LEVEL);
 #define SCCAN_ARBLSTENB  BIT(1)
 #define SCCAN_TRNSDNENB  BIT(0)
 
-/* CAN Controller IP Version Register */
-#define SCCAN_VER_MAJOR(x) (((x) & 0xff000000) >> 24)
-#define SCCAN_VER_MINOR(x) (((x) & 0x00ff0000) >> 16)
-#define SCCAN_VER_PATCH(x) (((x) & 0x0000ffff) >>  0)
+/* CAN Status Register */
+#define SCCAN_RXFFL   BIT(7)
+#define SCCAN_TXFFL   BIT(6)
+#define SCCAN_TXHBFL  BIT(5)
+#define SCCAN_TXFNEP  BIT(4)
+#define SCCAN_ESTS(x) (((x) & GENMASK(3,2)) >> 2)
+#define SCCAN_EWRN    BIT(1)
+#define SCCAN_BBUSY   BIT(0)
+
+/* CAN Interrupt Status Register */
+#define SCCAN_BUSOFF  BIT(13)
+#define SCCAN_ACKER   BIT(12)
+#define SCCAN_BITER   BIT(11)
+#define SCCAN_STFER   BIT(10)
+#define SCCAN_FMER    BIT(9)
+#define SCCAN_CRCER   BIT(8)
+#define SCCAN_RXFOVF  BIT(7)
+#define SCCAN_RXFUDF  BIT(6)
+#define SCCAN_RXFVAL  BIT(5)
+#define SCCAN_RCVDN   BIT(4)
+#define SCCAN_TXFOVF  BIT(3)
+#define SCCAN_TXHBOVF BIT(2)
+#define SCCAN_ARBLST  BIT(1)
+#define SCCAN_TRNSDN  BIT(0)
+
+/* CAN Interrupt Enable Register */
+#define SCCAN_IER_ALL_ENA (0x00003FFF)
+
+/* CAN TX Message Register1 */
+#define SCCAN_TXID1(x)    (x << 21)
+#define SCCAN_TXSRTR(x)   (x << 20)
+#define SCCAN_TXIDE(x)    (x << 19)
+#define SCCAN_TXID1(x)    (x << 21)
+#define SCCAN_TXID_EX1(x) ((x & GENMASK(28,18)) << 3)
+#define SCCAN_TXID_EX2(x) ((x & GENMASK(17,0)) << 1)
+#define SCCAN_TXERTR(x)   (x)
 
 /* CAN FIFO and Buffer Reset Register */
 #define SCCAN_FIFORR_TXHPBRST  BIT(17)
 #define SCCAN_FIFORR_TXFIFORST BIT(16)
 #define SCCAN_FIFORR_RXFIFORST BIT(0)
 
+/* CAN Controller IP Version Register */
+#define SCCAN_VER_MAJOR(x) (((x) & 0xff000000) >> 24)
+#define SCCAN_VER_MINOR(x) (((x) & 0x00ff0000) >> 16)
+#define SCCAN_VER_PATCH(x) (((x) & 0x0000ffff) >>  0)
+
 /* Timeout configuration for enable/disable CAN */
 #define SCCAN_ENABLE_RETRIES    (10)
 #define SCCAN_ENABLE_DELAY_USEC K_USEC(10)
 #define SCCAN_DISABLE_RETRIES    (10)
 #define SCCAN_DISABLE_DELAY_MSEC K_MSEC(10)
+
+/* FIFO DEPTH */
+#define SCCAN_TX_FIFO_DEPTH (64U)
 
 typedef void (*irq_init_func_t)(const struct device *dev);
 
@@ -117,6 +158,11 @@ struct sc_can_cfg {
 
 struct sc_can_data {
 	struct k_mutex inst_mutex;
+	struct k_sem tx_sem;
+	can_tx_callback_t tx_cb[SCCAN_TX_FIFO_DEPTH];
+	void *tx_cb_arg[SCCAN_TX_FIFO_DEPTH];
+	uint8_t tx_head;
+	uint8_t tx_tail;
 };
 
 static inline uint32_t sc_can_read32(const struct sc_can_cfg *config, uint32_t offset)
@@ -185,14 +231,85 @@ static int sc_can_disable(const struct sc_can_cfg *config)
 	return 0;
 }
 
+static uint32_t sc_can_get_idr(uint32_t id, bool extended, bool rtr)
+{
+	uint32_t idr;
+
+	if (extended) {
+		idr = (SCCAN_TXID_EX1(id) | SCCAN_TXSRTR(1) | SCCAN_TXIDE(extended) |
+		       SCCAN_TXID_EX2(id) | SCCAN_TXERTR(rtr));
+	} else {
+		idr = (SCCAN_TXID1(id) | SCCAN_TXSRTR(rtr) | SCCAN_TXIDE(extended));
+	}
+
+	return idr;
+}
+
+static void sc_can_tx_done(const struct device *dev, int status)
+{
+	struct sc_can_data *data = dev->data;
+	can_tx_callback_t callback;
+
+	callback = data->tx_cb[data->tx_tail];
+	if (callback != NULL) {
+		callback(dev, status, data->tx_cb_arg[data->tx_tail]);
+		data->tx_cb[data->tx_tail] = NULL;
+
+		data->tx_tail++;
+		if (data->tx_tail == SCCAN_TX_FIFO_DEPTH) {
+			data->tx_tail = 0;
+		}
+
+		k_sem_give(&data->tx_sem);
+	}
+}
+
 static void sc_can_isr(const struct device *dev)
 {
 	const struct sc_can_cfg *config = dev->config;
-
 	uint32_t isr;
 
 	isr = sc_can_read32(config, SCCAN_ISR_OFFSET);
 	LOG_DBG("IRQ Status 0x%08x", isr);
+
+	if (isr & SCCAN_BUSOFF) {
+	}
+	if (isr & SCCAN_ACKER) {
+		CAN_STATS_ACK_ERROR_INC(dev);
+		sc_can_tx_done(dev, SCCAN_ACKER);
+	}
+	if (isr & SCCAN_BITER) {
+		/* SC CAN does not distinguish between BIT0 and 1 errors,
+		 * so it counts on BIT0. */
+		CAN_STATS_BIT0_ERROR_INC(dev);
+		sc_can_tx_done(dev, SCCAN_BITER);
+	}
+	if (isr & SCCAN_STFER) {
+	}
+	if (isr & SCCAN_FMER) {
+	}
+	if (isr & SCCAN_CRCER) {
+	}
+	if (isr & SCCAN_RXFOVF) {
+	}
+	if (isr & SCCAN_RXFUDF) {
+	}
+	if (isr & SCCAN_RXFVAL) {
+	}
+	if (isr & SCCAN_RCVDN) {
+	}
+	if (isr & SCCAN_TXFOVF) {
+		sc_can_tx_done(dev, SCCAN_TXFOVF);
+	}
+	if (isr & SCCAN_TXHBOVF) {
+		/* TX High Priority Buffer is not used yet */
+	}
+	if (isr & SCCAN_ARBLST) {
+		sc_can_tx_done(dev, SCCAN_ARBLST);
+	}
+	if (isr & SCCAN_TRNSDN) {
+		sc_can_tx_done(dev, 0);
+	}
 
 	sc_can_write32(config, SCCAN_ISR_OFFSET, isr);
 }
@@ -241,6 +358,11 @@ static int sc_can_stop(const struct device *dev)
 			  SCCAN_FIFORR_TXHPBRST |
 			  SCCAN_FIFORR_TXFIFORST |
 			  SCCAN_FIFORR_RXFIFORST);
+
+		/* Notify the disable CAN to all TX callback */
+		for (int i = 0; i < SCCAN_TX_FIFO_DEPTH; i++) {
+			sc_can_tx_done(dev, -ENETDOWN);
+		}
 	}
 
 	k_mutex_unlock(&data->inst_mutex);
@@ -320,6 +442,60 @@ static int sc_can_send(const struct device *dev, const struct can_frame *frame,
 			 k_timeout_t timeout, can_tx_callback_t callback,
 			 void *user_data)
 {
+	const struct sc_can_cfg *config = dev->config;
+	struct sc_can_data *data = dev->data;
+	uint32_t idr;
+
+	__ASSERT_NO_MSG(callback != NULL);
+
+	LOG_DBG("Sending %d bytes on %s. Id: 0x%x, ID type: %s %s",
+		frame->dlc, dev->name, frame->id,
+		(frame->flags & CAN_FRAME_IDE) != 0 ? "extended" : "standard",
+		(frame->flags & CAN_FRAME_RTR) != 0 ? ", RTR frame" : "");
+
+	if (frame->dlc > CAN_MAX_DLC) {
+		LOG_ERR("DLC of %d exceeds maximum (%d)",
+			frame->dlc, CAN_MAX_DLC);
+		return -EINVAL;
+	}
+
+	if ((frame->flags & ~(CAN_FRAME_IDE | CAN_FRAME_RTR)) != 0) {
+		LOG_ERR("unsupported CAN frame flags 0x%02x", frame->flags);
+		return -ENOTSUP;
+	}
+
+	/* Check if the TX buffer is full */
+	if (k_sem_take(&data->tx_sem, timeout) != 0) {
+		return -EAGAIN;
+	}
+
+	if (!sc_can_is_enabled(config)) {
+		return -ENETDOWN;
+	}
+
+	k_mutex_lock(&data->inst_mutex, K_FOREVER);
+
+	/* Write CAN IDR to TMR1 */
+	idr = sc_can_get_idr(frame->id, (frame->flags & CAN_FRAME_IDE), (frame->flags & CAN_FRAME_RTR));
+	sc_can_write32(config, SCCAN_TMR1_OFFSET, idr);
+
+	/* Write DLC to TMR2 */
+	sc_can_write32(config, SCCAN_TMR2_OFFSET, frame->dlc);
+
+	/* Write CAN Data Frame to TMR3/TMR4 */
+	sc_can_write32(config, SCCAN_TMR3_OFFSET, sys_be32_to_cpu(frame->data_32[0]));
+	sc_can_write32(config, SCCAN_TMR4_OFFSET, sys_be32_to_cpu(frame->data_32[1]));
+
+	/* Save call back function */
+	data->tx_cb[data->tx_head] = callback;
+	data->tx_cb_arg[data->tx_head] = user_data;
+	data->tx_head++;
+	if (data->tx_head == SCCAN_TX_FIFO_DEPTH) {
+		data->tx_head  = 0;
+	}
+
+	k_mutex_unlock(&data->inst_mutex);
+
 	return 0;
 }
 
@@ -331,6 +507,7 @@ static int sc_can_add_rx_filter(const struct device *dev, can_rx_callback_t cb,
 
 static void sc_can_remove_rx_filter(const struct device *dev, int filter_id)
 {
+	return;
 }
 
 static int sc_can_init(const struct device *dev)
@@ -342,6 +519,10 @@ static int sc_can_init(const struct device *dev)
 	uint32_t v;
 
 	k_mutex_init(&data->inst_mutex);
+	k_sem_init(&data->tx_sem, SCCAN_TX_FIFO_DEPTH, SCCAN_TX_FIFO_DEPTH);
+
+	data->tx_head = 0;
+	data->tx_tail = 0;
 
 	/* Set timing according to dts default setting */
 	timing.sjw = config->sjw;
@@ -442,6 +623,7 @@ static const struct can_driver_api sc_can_driver_api = {
 		.clock_frequency = DT_INST_PROP(n, clock_frequency),		\
 		.bus_speed = DT_INST_PROP(n, bus_speed),			\
 		.sjw = DT_INST_PROP(n, sjw),					\
+		.sample_point = DT_INST_PROP(n, sample_point),			\
 		.max_bitrate = DT_INST_CAN_TRANSCEIVER_MAX_BITRATE(n, 1000000),	\
 	};									\
 	static struct sc_can_data sc_can_data_##n;				\
