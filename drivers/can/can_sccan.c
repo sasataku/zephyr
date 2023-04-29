@@ -125,6 +125,26 @@ LOG_MODULE_REGISTER(sc_can, CONFIG_CAN_LOG_LEVEL);
 #define SCCAN_TXID_EX2(x) ((x & GENMASK(17,0)) << 1)
 #define SCCAN_TXERTR(x)   (x)
 
+/* CAN RX Message Register1 */
+#define SCCAN_RXID1_STD(x) ((x & GENMASK(31,21)) >> 21)
+#define SCCAN_RXID1_EXT(x) ((x & GENMASK(31,21)) >> 3)
+#define SCCAN_RXSRTR(x)    ((x & BIT(20)) >> 20)
+#define SCCAN_RXIDE(x)     ((x & BIT(19)) >> 19)
+#define SCCAN_RXID2_EXT(x) ((x & GENMASK(18,1)) >> 1)
+#define SCCAN_RXERTR(x)    (x & BIT(0))
+
+/* CAN RX Message Register2: */
+#define SCCAN_DLC(x)  (x & GENMASK(3,0))
+
+/* CAN Acceptance Filter ID Mask Register */
+#define SCCAN_AFID1(x)    (x << 21)
+#define SCCAN_AFSRTR(x)   (x << 20)
+#define SCCAN_AFIDE(x)    (x << 19)
+#define SCCAN_AFID1(x)    (x << 21)
+#define SCCAN_AFID_EX1(x) ((x & GENMASK(28,18)) << 3)
+#define SCCAN_AFID_EX2(x) ((x & GENMASK(17,0)) << 1)
+#define SCCAN_AFERTR(x)   (x)
+
 /* CAN FIFO and Buffer Reset Register */
 #define SCCAN_FIFORR_TXHPBRST  BIT(17)
 #define SCCAN_FIFORR_TXFIFORST BIT(16)
@@ -163,6 +183,9 @@ struct sc_can_data {
 	void *tx_cb_arg[SCCAN_TX_FIFO_DEPTH];
 	uint8_t tx_head;
 	uint8_t tx_tail;
+	can_rx_callback_t rx_cb[CONFIG_CAN_SCCAN_MAX_FILTER];
+	void *rx_cb_arg[CONFIG_CAN_SCCAN_MAX_FILTER];
+	struct can_filter rx_filter[CONFIG_CAN_SCCAN_MAX_FILTER];
 };
 
 static inline uint32_t sc_can_read32(const struct sc_can_cfg *config, uint32_t offset)
@@ -206,6 +229,15 @@ static int sc_can_enable(const struct sc_can_cfg *config)
 	}
 
 	return 0;
+}
+
+static inline bool sc_can_filter_is_used(const struct sc_can_cfg *config, int filter_id)
+{
+	if ((sc_can_read32(config, SCCAN_AFER_OFFSET) & BIT(filter_id))) {
+		return true;
+	} else {
+		return false;
+	}
 }
 
 static int sc_can_disable(const struct sc_can_cfg *config)
@@ -264,6 +296,114 @@ static void sc_can_tx_done(const struct device *dev, int status)
 	}
 }
 
+static void sc_can_enable_acceptance_filter(const struct sc_can_cfg *config,
+					     int filter_id, const struct can_filter *filter)
+{
+	uint32_t mask_offset;
+	uint32_t value_offset;
+	uint32_t enable_reg;
+	uint32_t mask_reg = 0;
+	uint32_t value_reg = 0;
+	bool extended = filter->flags & CAN_FILTER_IDE;
+	bool rtr = filter->flags & CAN_FILTER_RTR;
+
+	mask_offset = SCCAN_AFIMR1_OFFSET + (filter_id * 0x20);
+	value_offset = SCCAN_AFIVR1_OFFSET + (filter_id * 0x20);
+
+	/* Enable Acceptance Filter */
+	enable_reg = sc_can_read32(config, SCCAN_AFER_OFFSET);
+	sc_can_write32(config, SCCAN_AFER_OFFSET, enable_reg | BIT(filter_id));
+
+	/* Regist Acceptance Filter Mask and Value */
+	if (filter->flags & CAN_FILTER_IDE) {
+		mask_reg = (SCCAN_AFID_EX1(filter->mask) | SCCAN_AFSRTR(1) | SCCAN_AFIDE(extended) |
+					SCCAN_AFID_EX2(filter->mask) | SCCAN_AFERTR(rtr));
+		value_reg = (SCCAN_AFID_EX1(filter->id) | SCCAN_AFSRTR(1) | SCCAN_AFIDE(extended) |
+					SCCAN_AFID_EX2(filter->id) | SCCAN_AFERTR(rtr));
+	} else {
+		mask_reg = (SCCAN_TXID1(filter->mask) | SCCAN_AFSRTR(rtr) | SCCAN_AFIDE(extended));
+		value_reg = (SCCAN_TXID1(filter->id) | SCCAN_AFSRTR(rtr) | SCCAN_AFIDE(extended));
+	}
+
+	sc_can_write32(config, mask_offset, mask_reg);
+	sc_can_write32(config, value_offset, value_reg);
+
+	return;
+}
+
+static void sc_can_read_idr(const struct sc_can_cfg *config, struct can_frame *can_frame)
+{
+	uint32_t idr;
+
+	idr = sc_can_read32(config, SCCAN_RMR1_OFFSET);
+
+	if (SCCAN_RXIDE(idr)) {
+		can_frame->id = (SCCAN_RXID1_EXT(idr) | SCCAN_RXID2_EXT(idr));
+		can_frame->flags |= CAN_FRAME_IDE;
+		if (SCCAN_RXERTR(idr)) {
+			can_frame->flags |= CAN_FRAME_RTR;
+		}
+	} else {
+		can_frame->id = SCCAN_RXID1_STD(idr);
+		if (SCCAN_RXSRTR(idr)) {
+			can_frame->flags |= CAN_FRAME_RTR;
+		}
+	}
+
+	return;
+}
+
+static void sc_can_rx_cb(const struct device *dev, struct can_frame *frame)
+{
+	struct sc_can_data *data = dev->data;
+	uint8_t filter_id;
+
+	/* In this driver, called the all RX callback that matched registered filter */
+	for (filter_id = 0; filter_id < CONFIG_CAN_SCCAN_MAX_FILTER; filter_id++) {
+		if (data->rx_cb[filter_id] == NULL) {
+			continue;
+		}
+
+		if (can_frame_matches_filter(frame, &data->rx_filter[filter_id])) {
+			data->rx_cb[filter_id](dev, frame, data->rx_cb_arg[filter_id]);
+			LOG_DBG("Filter matched. ID: %d", filter_id);
+		}
+	}
+
+	return;
+}
+
+static void sc_can_rx_isr(const struct device *dev)
+{
+	const struct sc_can_cfg *config = dev->config;
+	struct can_frame frame = {0};
+	uint32_t data0_reg;
+	uint32_t data1_reg;
+
+	/* Read CAN IDR from RMR1 */
+	sc_can_read_idr(config, &frame);
+
+	/* Read DLC from RMR2 */
+	frame.dlc = SCCAN_DLC(sc_can_read32(config, SCCAN_RMR2_OFFSET));
+
+	/* RMR3/RMR4 must be read to clear the FIFO regardless of the dlc */
+	data0_reg = sc_can_read32(config, SCCAN_RMR3_OFFSET);
+	frame.data_32[0] = sys_cpu_to_be32(data0_reg);
+
+	data1_reg = sc_can_read32(config, SCCAN_RMR4_OFFSET);
+	frame.data_32[1] = sys_cpu_to_be32(data1_reg);
+
+	LOG_DBG("Receiving %d bytes. Id: 0x%x, ID type: %s %s",
+		frame.dlc, frame.id,
+		(frame.flags & CAN_FRAME_IDE) != 0 ? "extended" : "standard",
+		(frame.flags & CAN_FRAME_RTR) != 0 ? ", RTR frame" : "");
+
+	/* Callback for specificed filter */
+	sc_can_rx_cb(dev, &frame);
+
+	return;
+}
+
 static void sc_can_isr(const struct device *dev)
 {
 	const struct sc_can_cfg *config = dev->config;
@@ -271,6 +411,8 @@ static void sc_can_isr(const struct device *dev)
 
 	isr = sc_can_read32(config, SCCAN_ISR_OFFSET);
 	LOG_DBG("IRQ Status 0x%08x", isr);
+
+	sc_can_write32(config, SCCAN_ISR_OFFSET, isr);
 
 	if (isr & SCCAN_BUSOFF) {
 	}
@@ -295,6 +437,7 @@ static void sc_can_isr(const struct device *dev)
 	if (isr & SCCAN_RXFUDF) {
 	}
 	if (isr & SCCAN_RXFVAL) {
+		sc_can_rx_isr(dev);
 	}
 	if (isr & SCCAN_RCVDN) {
 	}
@@ -310,8 +453,6 @@ static void sc_can_isr(const struct device *dev)
 	if (isr & SCCAN_TRNSDN) {
 		sc_can_tx_done(dev, 0);
 	}
-
-	sc_can_write32(config, SCCAN_ISR_OFFSET, isr);
 }
 
 static int sc_can_get_capabilities(const struct device *dev, can_mode_t *cap)
@@ -499,14 +640,108 @@ static int sc_can_send(const struct device *dev, const struct can_frame *frame,
 	return 0;
 }
 
+/*
+ * SC CAN controller has four "Acceptance filter" feature, so this driver use
+ * it as the "RX filter".
+ * And, due to the specifications of the SC CAN controller, Acceptance Filter
+ * can only be set when disable CAN.
+ * However, Zephyr specification don't defines the timing for adding/removing
+ * RX filter. In fact, CAN sample application (samples/drivers/can/counter) is
+ * called can_add_rx_filter_msgq() after can_start().
+ * Therefore, in this driver, temporarily disabled CAN and set
+ * "Acceptance filer" to SC CAN controller.
+ */
 static int sc_can_add_rx_filter(const struct device *dev, can_rx_callback_t cb,
 				  void *cb_arg, const struct can_filter *filter)
 {
-	return 0;
+	const struct sc_can_cfg *config = dev->config;
+	struct sc_can_data *data = dev->data;
+	bool do_disable = false;
+	int ret = 0;
+	int filter_id;
+
+	LOG_DBG("Setting filter ID: 0x%x, mask: 0x%x", filter->id, filter->mask);
+
+	k_mutex_lock(&data->inst_mutex, K_FOREVER);
+
+	if (sc_can_is_enabled(config)) {
+		/* Disable CAN with retry if enabled */
+		ret = sc_can_disable(config);
+		if (ret != 0) {
+			goto unlock;
+		}
+		do_disable = true;
+	}
+
+	ret = -ENOSPC;
+	for (filter_id = 0; filter_id < CONFIG_CAN_SCCAN_MAX_FILTER; filter_id++) {
+		if (!sc_can_filter_is_used(config, filter_id)) {
+			sc_can_enable_acceptance_filter(config, filter_id, filter);
+
+			data->rx_cb[filter_id] = cb;
+			data->rx_cb_arg[filter_id] = cb_arg;
+			data->rx_filter[filter_id] = *filter;
+			ret = filter_id;
+			break;
+		}
+	}
+
+	if (filter_id == CONFIG_CAN_SCCAN_MAX_FILTER) {
+		LOG_ERR("No free filter left");
+	} else {
+		LOG_DBG("Filter added. ID: %d", filter_id);
+	}
+
+	if (do_disable) {
+		/* Enable CAN if disabled in this API */
+		sc_can_enable(config);
+	}
+
+unlock:
+	k_mutex_unlock(&data->inst_mutex);
+
+	return ret;
 }
 
 static void sc_can_remove_rx_filter(const struct device *dev, int filter_id)
 {
+	const struct sc_can_cfg *config = dev->config;
+	struct sc_can_data *data = dev->data;
+	int ret;
+	uint32_t enable_reg;
+	bool do_disable = false;
+
+	if (filter_id >= CONFIG_CAN_SCCAN_MAX_FILTER) {
+		LOG_ERR("Filter ID of %d exceeds maximum (%d)",
+			filter_id, CONFIG_CAN_SCCAN_MAX_FILTER);
+		return;
+	}
+
+	k_mutex_lock(&data->inst_mutex, K_FOREVER);
+
+	if (sc_can_is_enabled(config)) {
+		/* Disable CAN with retry if enabled */
+		ret = sc_can_disable(config);
+		if (ret != 0) {
+			goto unlock;
+		}
+		do_disable = true;
+	}
+
+	enable_reg = sc_can_read32(config, SCCAN_AFER_OFFSET);
+	enable_reg &= ~BIT(filter_id);
+	sc_can_write32(config, SCCAN_AFER_OFFSET, enable_reg);
+	data->rx_cb[filter_id] = NULL;
+	LOG_DBG("Filter removed. ID: %d", filter_id);
+
+	if (do_disable) {
+		/* Enable CAN if disabled in this API */
+		sc_can_enable(config);
+	}
+
+unlock:
+	k_mutex_unlock(&data->inst_mutex);
+
 	return;
 }
 
@@ -523,6 +758,8 @@ static int sc_can_init(const struct device *dev)
 
 	data->tx_head = 0;
 	data->tx_tail = 0;
+
+	memset(data->rx_cb, 0, sizeof(data->rx_cb));
 
 	/* Set timing according to dts default setting */
 	timing.sjw = config->sjw;
@@ -568,9 +805,18 @@ static int sc_can_get_core_clock(const struct device *dev, uint32_t *rate)
 	return 0;
 }
 
+/*
+ * This API specification is here:
+ *   Get the maximum standard (11-bit) CAN ID filters if false, or extended (29-bit)
+ *   CAN ID filters if true
+ * Acceptance filter of SC CAN Controller supports both standard and extended, so
+ * always returns the same value.
+ */
 static int sc_can_get_max_filters(const struct device *dev, bool ide)
 {
-	return 0;
+	ARG_UNUSED(ide);
+
+	return CONFIG_CAN_SCCAN_MAX_FILTER;
 }
 
 static int sc_can_get_max_bitrate(const struct device *dev, uint32_t *max_bitrate)
