@@ -54,6 +54,10 @@ LOG_MODULE_REGISTER(sc_can, CONFIG_CAN_LOG_LEVEL);
 #define SCCAN_EN_DISABLE (0U)
 #define SCCAN_EN_ENABLE  (1U)
 
+/* CAN Error Count Register */
+#define SCCAN_RXECNT(x) (((x) & GENMASK(15,8)) >> 8)
+#define SCCAN_TXECNT(x) (((x) & GENMASK(7,0)))
+
 /* CAN Bit Timing Setting Register */
 #define SCCAN_BTSR_SJW(x) ((x) << 7)
 #define SCCAN_BTSR_TS2(x) ((x) << 4)
@@ -96,6 +100,10 @@ LOG_MODULE_REGISTER(sc_can, CONFIG_CAN_LOG_LEVEL);
 #define SCCAN_ESTS(x) (((x) & GENMASK(3,2)) >> 2)
 #define SCCAN_EWRN    BIT(1)
 #define SCCAN_BBUSY   BIT(0)
+#define SCCAN_ESTS_CAN_DISABLE   (0b00)
+#define SCCAN_ESTS_ERROR_ACTIVE  (0b01)
+#define SCCAN_ESTS_ERROR_PASSIVE (0b10)
+#define SCCAN_ESTS_BUS_OFF       (0b11)
 
 /* CAN Interrupt Status Register */
 #define SCCAN_BUSOFF  BIT(13)
@@ -186,6 +194,9 @@ struct sc_can_data {
 	can_rx_callback_t rx_cb[CONFIG_CAN_SCCAN_MAX_FILTER];
 	void *rx_cb_arg[CONFIG_CAN_SCCAN_MAX_FILTER];
 	struct can_filter rx_filter[CONFIG_CAN_SCCAN_MAX_FILTER];
+	can_state_change_callback_t state_change_cb;
+	void *state_change_cb_data;
+	enum can_state state;
 };
 
 static inline uint32_t sc_can_read32(const struct sc_can_cfg *config, uint32_t offset)
@@ -404,6 +415,74 @@ static void sc_can_rx_isr(const struct device *dev)
 	return;
 }
 
+static void sc_can_get_error_count(const struct sc_can_cfg *config,
+			      struct can_bus_err_cnt *err_cnt)
+{
+	uint32_t errcnt_reg;
+
+	errcnt_reg = sc_can_read32(config, SCCAN_ECNTR_OFFSET);
+	err_cnt->tx_err_cnt = SCCAN_TXECNT(errcnt_reg);
+	err_cnt->rx_err_cnt = SCCAN_RXECNT(errcnt_reg);
+}
+
+static int sc_can_get_state(const struct device *dev, enum can_state *state,
+			      struct can_bus_err_cnt *err_cnt)
+{
+	const struct sc_can_cfg *config = dev->config;
+	uint32_t status_reg;
+
+	status_reg = sc_can_read32(config, SCCAN_STSR_OFFSET);
+	switch (SCCAN_ESTS(status_reg)) {
+		case SCCAN_ESTS_CAN_DISABLE:
+			*state = CAN_STATE_STOPPED;
+			break;
+		case SCCAN_ESTS_ERROR_ACTIVE:
+			if (status_reg & SCCAN_EWRN) {
+				*state = CAN_STATE_ERROR_WARNING;
+			} else {
+				*state = CAN_STATE_ERROR_ACTIVE;
+			}
+			break;
+		case SCCAN_ESTS_ERROR_PASSIVE:
+			*state = CAN_STATE_ERROR_PASSIVE;
+			break;
+		case SCCAN_ESTS_BUS_OFF:
+		default:
+			*state = CAN_STATE_BUS_OFF;
+			break;
+	}
+
+	sc_can_get_error_count(config, err_cnt);
+
+	return 0;
+}
+
+static void sc_can_state_change(const struct device *dev)
+{
+	struct sc_can_data *data = dev->data;
+	const can_state_change_callback_t cb = data->state_change_cb;
+	void *user_data = data->state_change_cb_data;
+	struct can_bus_err_cnt err_cnt;
+	enum can_state new_state;
+
+	if (sc_can_get_state(dev, &new_state, &err_cnt) < 0) {
+		return;
+	}
+
+	if (data->state == new_state) {
+		return;
+	}
+
+	LOG_DBG("Can state change new: %u, old: %u", new_state, data->state);
+
+	if (cb == NULL) {
+		return;
+	}
+
+	data->state = new_state;
+	cb(dev, new_state, err_cnt, user_data);
+}
+
 static void sc_can_isr(const struct device *dev)
 {
 	const struct sc_can_cfg *config = dev->config;
@@ -415,6 +494,7 @@ static void sc_can_isr(const struct device *dev)
 	sc_can_write32(config, SCCAN_ISR_OFFSET, isr);
 
 	if (isr & SCCAN_BUSOFF) {
+		sc_can_state_change(dev);
 	}
 	if (isr & SCCAN_ACKER) {
 		CAN_STATS_ACK_ERROR_INC(dev);
@@ -474,6 +554,11 @@ static int sc_can_start(const struct device *dev)
 
 	ret = sc_can_enable(config);
 
+	if (ret == 0) {
+		/* Notify state change to callback, if enabled */
+		sc_can_state_change(dev);
+	}
+
 	k_mutex_unlock(&data->inst_mutex);
 
 	return ret;
@@ -504,6 +589,9 @@ static int sc_can_stop(const struct device *dev)
 		for (int i = 0; i < SCCAN_TX_FIFO_DEPTH; i++) {
 			sc_can_tx_done(dev, -ENETDOWN);
 		}
+
+		/* Notify state change to callback */
+		sc_can_state_change(dev);
 	}
 
 	k_mutex_unlock(&data->inst_mutex);
@@ -556,12 +644,10 @@ static void sc_can_set_state_change_callback(const struct device *dev,
 					       can_state_change_callback_t cb,
 					       void *user_data)
 {
-}
+	struct sc_can_data *data = dev->data;
 
-static int sc_can_get_state(const struct device *dev, enum can_state *state,
-			      struct can_bus_err_cnt *err_cnt)
-{
-	return 0;
+	data->state_change_cb = cb;
+	data->state_change_cb_data = user_data;
 }
 
 #ifndef CONFIG_CAN_AUTO_BUS_OFF_RECOVERY
@@ -760,6 +846,9 @@ static int sc_can_init(const struct device *dev)
 	data->tx_tail = 0;
 
 	memset(data->rx_cb, 0, sizeof(data->rx_cb));
+
+	data->state = CAN_STATE_STOPPED;
+	data->state_change_cb = NULL;
 
 	/* Set timing according to dts default setting */
 	timing.sjw = config->sjw;
