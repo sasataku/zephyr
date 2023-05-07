@@ -158,6 +158,10 @@ LOG_MODULE_REGISTER(sc_can, CONFIG_CAN_LOG_LEVEL);
 #define SCCAN_FIFORR_TXFIFORST BIT(16)
 #define SCCAN_FIFORR_RXFIFORST BIT(0)
 
+/* CAN Self Test Mode Control Register */
+#define SCCAN_STM_DISABLE (0U)
+#define SCCAN_STM_ENABLE  (1U)
+
 /* CAN Controller IP Version Register */
 #define SCCAN_VER_MAJOR(x) (((x) & 0xff000000) >> 24)
 #define SCCAN_VER_MINOR(x) (((x) & 0x00ff0000) >> 16)
@@ -537,6 +541,10 @@ static void sc_can_isr(const struct device *dev)
 
 static int sc_can_get_capabilities(const struct device *dev, can_mode_t *cap)
 {
+	ARG_UNUSED(dev);
+
+	*cap = CAN_MODE_NORMAL | CAN_MODE_LOOPBACK;
+
 	return 0;
 }
 
@@ -601,6 +609,35 @@ static int sc_can_stop(const struct device *dev)
 
 static int sc_can_set_mode(const struct device *dev, can_mode_t mode)
 {
+	const struct sc_can_cfg *config = dev->config;
+	struct sc_can_data *data = dev->data;
+	uint32_t mode_reg = 0;
+
+	if ((mode & ~CAN_MODE_LOOPBACK) != 0) {
+		LOG_ERR("Unsupported mode: 0x%08x", mode);
+		return -ENOTSUP;
+	}
+
+	if (sc_can_is_enabled(config)) {
+		return -EBUSY;
+	}
+
+	k_mutex_lock(&data->inst_mutex, K_FOREVER);
+
+	if ((mode & CAN_MODE_LOOPBACK) != 0) {
+		/* Self Test Mode */
+		mode_reg = SCCAN_STM_ENABLE;
+	} else {
+		/* Normal Mode */
+		mode_reg = SCCAN_STM_DISABLE;
+	}
+
+	sc_can_write32(config, SCCAN_STMCR_OFFSET, mode_reg);
+
+	k_mutex_unlock(&data->inst_mutex);
+
+	LOG_DBG("Set mode:%d", mode);
+
 	return 0;
 }
 
