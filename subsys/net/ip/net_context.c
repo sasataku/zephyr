@@ -2401,9 +2401,19 @@ static int recv_udp(struct net_context *context,
 
 	ARG_UNUSED(timeout);
 
+	/* If net context already have connection handler, then it effectively
+	 * means that it's already bound to an interface/port and register a
+	 * connection. In that case, it's just a matter of updating the
+	 * callback registered in the net_context and the user data passed to
+	 * that callback. The callback function passed to net_conn_change_callback()
+	 * specifies same function passed in net_conn_register().
+	 */
 	if (context->conn_handler) {
-		net_conn_unregister(context->conn_handler);
-		context->conn_handler = NULL;
+		context->recv_cb = cb;
+		ret = net_conn_change_callback(context->conn_handler,
+					 net_context_packet_received,
+					 user_data);
+		goto end;
 	}
 
 	ret = bind_default(context);
@@ -2449,6 +2459,7 @@ static int recv_udp(struct net_context *context,
 				user_data,
 				&context->conn_handler);
 
+end:
 	return ret;
 }
 #else
